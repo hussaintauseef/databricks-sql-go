@@ -4,28 +4,25 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
+	"github.com/databricks/databricks-sql-go/auth/pat"
 	"github.com/databricks/databricks-sql-go/driverctx"
 	"github.com/databricks/databricks-sql-go/internal/cli_service"
 	"github.com/databricks/databricks-sql-go/internal/client"
 	"github.com/databricks/databricks-sql-go/internal/config"
-	"github.com/databricks/databricks-sql-go/internal/sentinel"
 	"github.com/databricks/databricks-sql-go/logger"
-	"github.com/pkg/errors"
 )
 
 type connector struct {
-	cfg *config.Config
+	cfg    *config.Config
+	client *http.Client
 }
 
+// Connect returns a connection to the Databricks database from a connection pool.
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
-
-	tclient, err := client.InitThriftClient(c.cfg)
-	if err != nil {
-		return nil, wrapErr(err, "error initializing thrift client")
-	}
 	var catalogName *cli_service.TIdentifier
 	var schemaName *cli_service.TIdentifier
 	if c.cfg.Catalog != "" {
@@ -35,28 +32,23 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 		schemaName = cli_service.TIdentifierPtr(cli_service.TIdentifier(c.cfg.Schema))
 	}
 
-	// we need to ensure that open session will eventually end
-	sentinel := sentinel.Sentinel{
-		OnDoneFn: func(statusResp any) (any, error) {
-			return tclient.OpenSession(ctx, &cli_service.TOpenSessionReq{
-				ClientProtocol: c.cfg.ThriftProtocolVersion,
-				Configuration:  make(map[string]string),
-				InitialNamespace: &cli_service.TNamespace{
-					CatalogName: catalogName,
-					SchemaName:  schemaName,
-				},
-				CanUseMultipleCatalogs: &c.cfg.CanUseMultipleCatalogs,
-			})
-		},
+	tclient, err := client.InitThriftClient(c.cfg, c.client)
+	if err != nil {
+		return nil, wrapErr(err, "error initializing thrift client")
 	}
-	// default timeout in here in addition to potential context timeout
-	_, res, err := sentinel.Watch(ctx, c.cfg.PollInterval, c.cfg.ConnectTimeout)
+
+	session, err := tclient.OpenSession(ctx, &cli_service.TOpenSessionReq{
+		ClientProtocol: c.cfg.ThriftProtocolVersion,
+		Configuration:  make(map[string]string),
+		InitialNamespace: &cli_service.TNamespace{
+			CatalogName: catalogName,
+			SchemaName:  schemaName,
+		},
+		CanUseMultipleCatalogs: &c.cfg.CanUseMultipleCatalogs,
+	})
+
 	if err != nil {
 		return nil, wrapErrf(err, "error connecting: host=%s port=%d, httpPath=%s", c.cfg.Host, c.cfg.Port, c.cfg.HTTPPath)
-	}
-	session, ok := res.(*cli_service.TOpenSessionResp)
-	if !ok {
-		return nil, errors.New("databricks: invalid open session response")
 	}
 
 	conn := &conn{
@@ -80,6 +72,7 @@ func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
 	return conn, nil
 }
 
+// Driver returns underlying databricksDriver for compatibility with sql.DB Driver method
 func (c *connector) Driver() driver.Driver {
 	return &databricksDriver{}
 }
@@ -88,7 +81,7 @@ var _ driver.Connector = (*connector)(nil)
 
 type connOption func(*config.Config)
 
-// NewConnector creates a connection that can be used with sql.OpenDB().
+// NewConnector creates a connection that can be used with `sql.OpenDB()`.
 // This is an easier way to set up the DB instead of having to construct a DSN string.
 func NewConnector(options ...connOption) (driver.Connector, error) {
 	// config with default options
@@ -97,9 +90,16 @@ func NewConnector(options ...connOption) (driver.Connector, error) {
 	for _, opt := range options {
 		opt(cfg)
 	}
-	// validate config?
 
-	return &connector{cfg}, nil
+	client := client.RetryableClient(cfg)
+
+	return &connector{cfg: cfg, client: client}, nil
+}
+
+func withUserConfig(ucfg config.UserConfig) connOption {
+	return func(c *config.Config) {
+		c.UserConfig = ucfg
+	}
 }
 
 // WithServerHostname sets up the server hostname. Mandatory.
@@ -119,16 +119,37 @@ func WithPort(port int) connOption {
 	}
 }
 
+// WithRetries sets up retrying logic. Sane defaults are provided. Negative retryMax will disable retry behavior
+// By default retryWaitMin = 1 * time.Second
+// By default retryWaitMax = 30 * time.Second
+// By default retryMax = 4
+func WithRetries(retryMax int, retryWaitMin time.Duration, retryWaitMax time.Duration) connOption {
+	return func(c *config.Config) {
+		c.RetryWaitMax = retryWaitMax
+		c.RetryWaitMin = retryWaitMin
+		c.RetryMax = retryMax
+	}
+}
+
 // WithAccessToken sets up the Personal Access Token. Mandatory for now.
 func WithAccessToken(token string) connOption {
 	return func(c *config.Config) {
-		c.AccessToken = token
+		if token != "" {
+			c.AccessToken = token
+			pat := &pat.PATAuth{
+				AccessToken: token,
+			}
+			c.Authenticator = pat
+		}
 	}
 }
 
 // WithHTTPPath sets up the endpoint to the warehouse. Mandatory.
 func WithHTTPPath(path string) connOption {
 	return func(c *config.Config) {
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
 		c.HTTPPath = path
 	}
 }

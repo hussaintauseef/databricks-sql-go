@@ -6,11 +6,10 @@ import (
 
 	"github.com/databricks/databricks-sql-go/logger"
 	"github.com/pkg/errors"
-	"github.com/rs/zerolog/log"
 )
 
 const (
-	DEFAULT_TIMEOUT  = 0
+	DEFAULT_TIMEOUT  = 0 //no timeout
 	DEFAULT_INTERVAL = 100 * time.Millisecond
 )
 
@@ -83,15 +82,6 @@ func (s Sentinel) Watch(ctx context.Context, interval, timeout time.Duration) (W
 			resCh <- ret
 		}
 	}
-	canceler := func(ctx context.Context, reason string) {
-		_, err := s.OnCancelFn()
-		if err != nil {
-			log.Err(err).Msgf("cancel failed after %s", reason)
-			return
-		}
-		log.Debug().Msgf("cancel success")
-	}
-
 	for {
 		select {
 		case <-intervalTimer.C:
@@ -117,7 +107,12 @@ func (s Sentinel) Watch(ctx context.Context, interval, timeout time.Duration) (W
 			_ = intervalTimer.Stop()
 			if s.OnCancelFn != nil && !s.onCancelFnCalled {
 				s.onCancelFnCalled = true
-				go canceler(ctx, ctx.Err().Error())
+				_, err := s.OnCancelFn()
+				if err != nil {
+					logger.Err(err).Msg("databricks: cancel failed")
+					return WatchCanceled, nil, errors.Wrap(err, ctx.Err().Error())
+				}
+				logger.Debug().Msgf("databricks: cancel success")
 			}
 			return WatchCanceled, nil, errors.Wrap(ctx.Err(), "sentinel context done")
 		case <-timeoutTimerCh:
@@ -126,8 +121,14 @@ func (s Sentinel) Watch(ctx context.Context, interval, timeout time.Duration) (W
 			_ = intervalTimer.Stop()
 			if s.OnCancelFn != nil && !s.onCancelFnCalled {
 				s.onCancelFnCalled = true
-				go canceler(ctx, err.Error())
+				_, err := s.OnCancelFn()
+				if err != nil {
+					logger.Err(err).Msg("databricks: cancel failed")
+					return WatchCanceled, nil, errors.Wrap(err, ctx.Err().Error())
+				}
+				logger.Debug().Msgf("databricks: cancel success")
 			}
+
 			return WatchTimeout, nil, err
 		}
 	}
